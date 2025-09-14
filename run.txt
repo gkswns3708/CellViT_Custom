@@ -1,0 +1,23 @@
+# ViT CpMSePTrain
+python train_custom_ViT.py \
+  --train_root Dataset/transformed/CoNSeP/Train \
+  --val_root   Dataset/transformed/CoNSeP/Test \
+  --num_classes 6 \
+  --epochs 50 \
+  --batch_size 8 \
+  --lr 1e-4 \
+  --vit_ckpt /workspace/CellViT_Custom/Checkpoints/CellViT/CellViT-256-x40.pth
+
+# PanNuke CV3 Train
+python train_eval_pannuke_cv3.py \
+  --hf_repo RationAI/PanNuke \
+  --epochs 130 --freeze_epochs 25 \
+  --batch_size 8 --lr 1e-4 \
+  --init_full_ckpt Checkpoints/CellViT/CellViT-256-x40.pth \
+  --out Checkpoints/CellViT/cv3
+
+# CV Fold Evaludation with Instance
+python eval_instance_pannuke_cv3.py \
+  --hf_repo RationAI/PanNuke \
+  --ckpt_root /workspace/CellViT_Custom/Checkpoints/CellViT/cv3 \
+  --out eval_instance_cv3

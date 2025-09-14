@@ -1,3 +1,6 @@
 Checkpoints/
-Data/
 Dataset/
+wandb/
+tools
+utils/
+**/__pycache__/

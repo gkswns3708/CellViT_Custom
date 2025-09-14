@@ -9,9 +9,6 @@
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
-# ! 후처리용 cell들을 instance화 하기 위해 사용됨.
-
-
 
 import warnings
 from typing import Tuple, Literal
