@@ -21,3 +21,9 @@ python eval_instance_pannuke_cv3.py \
   --hf_repo RationAI/PanNuke \
   --ckpt_root /workspace/CellViT_Custom/Checkpoints/CellViT/cv3 \
   --out eval_instance_cv3
+
+# visualization with PANNUKE Dataest
+python viz_predictions.py --dataset pannuke_hf \
+  --hf_repo RationAI/PanNuke \
+  --ckpt_root /workspace/CellViT_Custom/Checkpoints/CellViT/cv3 \
+  --out vis_out --match paper --magnification 40

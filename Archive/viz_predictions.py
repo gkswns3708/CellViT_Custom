@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 # local datasets
 from Data.CoNSeP_patch import ConsepPatchDataset
 from Data.CoNSeP_patch_merged import ConsepPatchDatasetMerged
-# HF PanNuke loader
+# HF PanNuke loader (앞서 드린 파일 사용)
 from Data.PanNuke_hf import PanNukeHFDataset
 
 from Model.CellViT_ViT256_Custom import CellViTCustom
@@ -24,6 +24,12 @@ from Model.CellViT_ViT256_Custom import CellViTCustom
 # Label spec (id->name, palette, remap)
 # -----------------------------
 def label_spec(dataset: str, merge_consep: bool) -> Tuple[Dict[int,str], Dict[int,Tuple[int,int,int]], Dict[int,int]]:
+    """
+    returns:
+      id2name: {class_id:int -> name:str}  (0은 배경이므로 필요시 제외)
+      palette: {class_id:int -> (R,G,B)}
+      remap:   {src_id:int -> dst_id:int}  (머지/아이덴티티)
+    """
     dataset = dataset.lower()
 
     if dataset == 'consep':
@@ -125,9 +131,10 @@ def evaluate_and_visualize(args):
 
     # Dataset/Loader
     if args.dataset == 'pannuke_hf':
+        from Data.PanNuke_hf import PanNukeHFDataset
         ds = PanNukeHFDataset(
             repo_id=args.hf_repo,
-            split=args.hf_split,   # 기본 fold1
+            split=args.hf_split,
             fold=args.hf_fold,
             normalize=True
         )
@@ -147,9 +154,12 @@ def evaluate_and_visualize(args):
     # Model
     model = CellViTCustom(
         num_nuclei_classes=args.num_classes,
-        img_size=args.img_size, patch_size=args.patch_size,
-        embed_dim=args.vit_embed_dim, depth=args.vit_depth,
-        num_heads=args.vit_heads, mlp_ratio=args.vit_mlp_ratio,
+        img_size=args.img_size,
+        patch_size=args.patch_size,
+        embed_dim=args.vit_embed_dim,     # <- CellViTCustom 시그니처는 embed_dim
+        depth=args.vit_depth,
+        num_heads=args.vit_heads,
+        mlp_ratio=args.vit_mlp_ratio,
     ).to(device).eval()
 
     # Load weights
@@ -172,27 +182,33 @@ def evaluate_and_visualize(args):
         t = batch['type_map'].cpu().numpy()
         paths = batch['path_image']
 
-        # forward
+        # forward (no autocast needed here)
         nt_logits = model(x)['nuclei_type_map']
         nt_pred = torch.argmax(nt_logits, dim=1).cpu().numpy()
 
-        # CoNSeP merged remap
+        # remap when necessary (CoNSeP merged)
         if args.dataset.startswith('consep') and args.merge_consep:
             vt = np.vectorize(lambda k: remap.get(int(k), int(k)))
             t = np.stack([vt(t[i]) for i in range(t.shape[0])], axis=0)
             nt_pred = np.stack([vt(nt_pred[i]) for i in range(nt_pred.shape[0])], axis=0)
 
-        t = np.clip(t, 0, C); nt_pred = np.clip(nt_pred, 0, C)
+        # clamp safety
+        t = np.clip(t, 0, C)
+        nt_pred = np.clip(nt_pred, 0, C)
+
+        # update confusion
         update_confusion(conf, t.reshape(-1), nt_pred.reshape(-1), C)
 
+        # visualize (GT vs Pred, + legend)
         if args.max_samples > 0:
             for b in range(x.size(0)):
-                if saved >= args.max_samples: break
+                if saved >= args.max_samples:
+                    break
                 img = (x[b].cpu().numpy().transpose(1,2,0) * 255.0).round().astype(np.uint8)
-                gt_rgb = colorize_label(t[b], palette)
-                pr_rgb = colorize_label(nt_pred[b], palette)
-                gt_ov  = blend_overlay(img, gt_rgb, alpha=args.type_alpha)
-                pr_ov  = blend_overlay(img, pr_rgb, alpha=args.type_alpha)
+                gt_rgb   = colorize_label(t[b], palette)
+                pr_rgb   = colorize_label(nt_pred[b], palette)
+                gt_ov    = blend_overlay(img, gt_rgb, alpha=args.type_alpha)
+                pr_ov    = blend_overlay(img, pr_rgb, alpha=args.type_alpha)
 
                 fig = plt.figure(figsize=(12, 8))
                 ax1 = plt.subplot(2,2,1); ax1.imshow(img);   ax1.set_title("Input");       ax1.axis('off')
@@ -203,11 +219,12 @@ def evaluate_and_visualize(args):
                 ax4 = plt.subplot(2,2,4); ax4.axis('off')
                 ax4.legend(handles=handles, title="Cell types", loc='center'); ax4.set_title("Legend")
 
-                stem = Path(paths[b]).stem if isinstance(paths[b], str) else str(paths[b])
+                stem = Path(paths[b]).stem
                 out_path = out_dir / f"{stem}_typeviz_gt_pred.png"
                 plt.tight_layout(); plt.savefig(out_path, dpi=150, bbox_inches='tight'); plt.close(fig)
                 saved += 1
 
+    # metrics
     overall_acc, per_class = metrics_from_confusion(conf, classes_to_eval)
     print("\n[Type classification metrics]")
     print(f"Overall accuracy: {overall_acc:.4f}")
@@ -235,18 +252,18 @@ def evaluate_and_visualize(args):
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate per-class F1/ACC and visualize GT/PRED type maps.")
     # dataset selector
-    p.add_argument('--dataset', type=str, default='pannuke_hf',
+    p.add_argument('--dataset', type=str, default='consep',
                    choices=['consep', 'consep_merged', 'pannuke_hf'])
 
     # CoNSeP: needs root
     p.add_argument('--root', type=Path, default=None,
-                   help='Dataset root containing images/ and labels/ (for consep/consep_merged)')
+                   help='Dataset root containing images/ and labels/ (required for consep/consep_merged)')
     p.add_argument('--merge_consep', action='store_true',
-                   help='Only for CoNSeP: merge (3,4)->epithelial; (5,6,7)->spindle')
+                   help='Only for CoNSeP: merge (3,4)->epithelial; (5,6,7)->spindle (viz/metrics remap)')
 
-    # PanNuke(HF)
+    # PanNuke(HF) options
     p.add_argument('--hf_repo', type=str, default='tio-ikim/pannuke')
-    p.add_argument('--hf_split', type=str, default='fold1')  # <-- 기본 fold1 (이전 validation 에러 방지)
+    p.add_argument('--hf_split', type=str, default='validation')  # train/validation/test
     p.add_argument('--hf_fold', type=int, default=None)
 
     # common
@@ -262,13 +279,13 @@ def parse_args():
     # ViT-256 hyperparams (match your model)
     p.add_argument('--img_size', type=int, default=256)
     p.add_argument('--patch_size', type=int, default=16)
-    p.add_argument('--vit_embed_dim', type=int, default=384)
+    p.add_argument('--vit_embed_dim', type=int, default=384)  # <- CellViTCustom(embed_dim=..)
     p.add_argument('--vit_depth', type=int, default=12)
     p.add_argument('--vit_heads', type=int, default=6)
     p.add_argument('--vit_mlp_ratio', type=float, default=4.0)
 
     # num_classes (incl. background!)
-    # consep=8, consep_merged=5, pannuke=6
+    # consep(original)=8, consep(merged)=5, pannuke=6
     p.add_argument('--num_classes', type=int, default=6,
                    help='#type classes incl. background. consep=8, consep_merged=5, pannuke=6')
     return p.parse_args()
@@ -276,6 +293,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # quick sanity for --root
     if args.dataset in ('consep', 'consep_merged') and args.root is None:
         raise SystemExit("--root is required for CoNSeP datasets.")
+    if args.dataset == 'consep' and args.merge_consep:
+        print("[warn] --merge_consep has no effect when --dataset=consep_merged is available.")
     evaluate_and_visualize(args)

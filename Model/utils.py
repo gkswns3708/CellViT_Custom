@@ -231,3 +231,4 @@ class ViTCellViTDeit(ImageEncoderViT):
         _output = rearrange(output, "b c h w -> b c (h w)")
 
         return torch.mean(_output, axis=-1), output, extracted_layers
+

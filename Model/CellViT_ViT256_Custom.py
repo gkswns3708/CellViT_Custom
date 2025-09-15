@@ -168,10 +168,10 @@ class CellViTCustom(nn.Module):
             out["nuclei_binary_map"] = nb_full[:, :2, :, :]
             out["regression_map"]    = nb_full[:, 2:, :, :]
         else:
-            out["nuclei_binary_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.np_decoder)
+            out["nuclei_binary_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.np_decoder) # type: ignore
 
-        out["hv_map"]          = self._forward_branch(z0, z1, z2, z3, z4, self.hv_decoder)
-        out["nuclei_type_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.nt_decoder)
+        out["hv_map"]          = self._forward_branch(z0, z1, z2, z3, z4, self.hv_decoder) # type: ignore
+        out["nuclei_type_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.nt_decoder) # type: ignore
 
         if retrieve_tokens:
             out["tokens"] = z4
