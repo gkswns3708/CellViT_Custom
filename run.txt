@@ -1,23 +1,71 @@
 # Download Model Checkpoints
 gdown --folder https://drive.google.com/drive/folders/1zFO4bgo7yvjT9rCJi_6Mt6_07wfr0CKU -O /workspace/CellViT_Custom/Checkpoints
 
-# ViT CpMSePTrain
+# Preprocessing CoNSeP
+Download from https://opendatalab.com/OpenDataLab/CoNSeP
+For Train
+
+python preprocessing.py \
+  --images_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Train/Images \
+  --labels_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Train/Labels \
+  --out_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Train \
+  --image_suffix .png \
+  --label_suffix .mat \
+  --save_binary
+
+python preprocessing.py \
+  --images_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Test/Images \
+  --labels_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Test/Labels \
+  --out_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Test \
+  --image_suffix .png \
+  --label_suffix .mat \
+  --save_binary
+
+# Evaluation CoNSeP on Best Model Checkpoints
+python eval_instance_CoNSeP.py \
+  --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
+  --test_root Dataset/CoNSeP/Preprocessed/Test \
+  --batch_size 8 --device cuda \
+  --iou_thr 0.5 --bin_thresh 0.5 --min_area 10 \
+  --fg_index -1 --bg_index 0 \
+  --class_names bg,epithelial,inflammatory,spindleshaped,miscellaneous
+
+python eval_instance_CoNSeP.py \
+  --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
+  --test_root Dataset/CoNSeP/Preprocessed/Test \
+  --batch_size 8 --device cuda \
+  --iou_thr 0.5 --bin_thresh 0.5 --min_area 10 \
+  --fg_index -1 --bg_index 0 \
+  --class_names bg,other,inflammatory,epithelial,spindle \
+  --save_viz_dir viz_out --viz_max 64
+
+# ViT CoNSePTrain
 python train_custom_ViT.py \
-  --train_root Dataset/transformed/CoNSeP/Train \
-  --val_root   Dataset/transformed/CoNSeP/Test \
-  --num_classes 6 \
+  --dataset consep_merged \
+  --train_root Dataset/CoNSeP/Preprocessed/Train \
+  --val_root Dataset/CoNSeP/Preprocessed/Test \
+  --num_classes 5 \
   --epochs 50 \
   --batch_size 8 \
   --lr 1e-4 \
   --vit_ckpt /workspace/CellViT_Custom/Checkpoints/CellViT/CellViT-256-x40.pth
 
+
 # PanNuke CV3 Train
 python train_eval_pannuke_cv3.py \
+  --hf_repo RationAI/PanNuke \
+  --epochs 130 --freeze_epochs 25 \
+  --batch_size 64 --lr 1e-4 \
+  --init_full_ckpt Checkpoints/CellViT/CellViT-256-x40.pth \
+  --out Checkpoints/CellViT/cv3
+
+python train_custom_ViT.py   
   --hf_repo RationAI/PanNuke \
   --epochs 130 --freeze_epochs 25 \
   --batch_size 8 --lr 1e-4 \
   --init_full_ckpt Checkpoints/CellViT/CellViT-256-x40.pth \
   --out Checkpoints/CellViT/cv3
+
 
 # CV Fold Evaludation with Instance
 python eval_instance_pannuke_cv3.py \

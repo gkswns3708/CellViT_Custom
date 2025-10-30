@@ -102,7 +102,7 @@ def validate(model, dl, device):
     model.eval()
     sums = {}
     count = 0
-    for batch in dl:
+    for batch in tqdm(dl, ncols=100, desc="  Val"):
         x = batch['image'].to(device, non_blocking=True)
         type_map = batch['type_map'].to(device, non_blocking=True)
         hv_map   = batch['hv_map'].to(device, non_blocking=True)
@@ -175,8 +175,19 @@ def main():
     # init: full-model ckpt 우선
     if args.init_full_ckpt is not None and Path(args.init_full_ckpt).exists():
         print(f"[init] loading FULL model ckpt: {args.init_full_ckpt}")
-        sd = torch.load(str(args.init_full_ckpt), map_location='cpu')
-        sd = sd.get('model', sd)
+        sd_blob = torch.load(str(args.init_full_ckpt), map_location='cpu')
+        # 다양한 포맷 대응: model_state_dict > model > state_dict 우선 순위
+        sd = sd_blob
+        if isinstance(sd_blob, dict):
+            for key in ['model_state_dict', 'model', 'state_dict']:
+                if key in sd_blob and isinstance(sd_blob[key], dict):
+                    sd = sd_blob[key]
+                    print(f"[init] picked state_dict from key: '{key}'")
+                    break
+        # DataParallel 등 prefix 보정
+        if isinstance(sd, dict) and any(k.startswith("module.") for k in sd.keys()):
+            sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+            print("[init] stripped 'module.' prefix from keys")
         msg = model.load_state_dict(sd, strict=False)
         print(f"[init] loaded (strict=False).")
         try:

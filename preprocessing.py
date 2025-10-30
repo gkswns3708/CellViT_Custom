@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Preprocessing for CellViT/SAM training (CoNSeP-friendly, .mat labels).
@@ -22,12 +23,14 @@ Preprocessing for CellViT/SAM training (CoNSeP-friendly, .mat labels).
 Usage example:
 
 python preprocess_cellvit_patches.py \
-  --images_dir /workspace/CellViT_Custom/Dataset/Original/CoNSeP/Train/Images \
-  --labels_dir /workspace/CellViT_Custom/Dataset/Original/CoNSeP/Train/Labels \
-  --out_dir /workspace/CellViT_Custom/Dataset/transformed/CoNSeP/Train \
+  --images_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Train/Images \
+  --labels_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Original/Train/Labels \
+  --out_dir /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Train \
   --image_suffix .png \
   --label_suffix .mat \
   --save_binary
+
+
 
 """
 
@@ -41,6 +44,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 # Optional deps for .mat support
 try:
@@ -377,7 +381,7 @@ def main():
         return
 
     meta_rows: List[Dict[str, str]] = []
-    for img_path, lbl_path in pairs:
+    for img_path, lbl_path in tqdm(pairs):
         rows = process_case(
             img_path,
             lbl_path,

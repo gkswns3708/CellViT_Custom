@@ -125,9 +125,9 @@ class CellViTCustom(nn.Module):
             "nuclei_type_map": self.num_nuclei_classes,    # (C_types)
         }
 
-        self.np_decoder = self._create_branch(self.branches_out["nuclei_binary_map"])
-        self.hv_decoder = self._create_branch(self.branches_out["hv_map"])
-        self.nt_decoder = self._create_branch(self.branches_out["nuclei_type_map"])
+        self.nuclei_binary_map_decoder = self._create_branch(self.branches_out["nuclei_binary_map"])
+        self.hv_map_decoder            = self._create_branch(self.branches_out["hv_map"])
+        self.nuclei_type_maps_decoder  = self._create_branch(self.branches_out["nuclei_type_map"])  # 'maps' 복수 주의
 
     # ---------- Forward ----------
     def forward(self, x: torch.Tensor, retrieve_tokens: bool = False) -> Dict[str, torch.Tensor]:
@@ -164,14 +164,14 @@ class CellViTCustom(nn.Module):
 
         # per-branch upsampling
         if self.regression_loss:
-            nb_full = self._forward_branch(z0, z1, z2, z3, z4, self.np_decoder) # type: ignore
+            nb_full = self._forward_branch(z0, z1, z2, z3, z4, self.nuclei_binary_map_decoder) # type: ignore
             out["nuclei_binary_map"] = nb_full[:, :2, :, :]
             out["regression_map"]    = nb_full[:, 2:, :, :]
         else:
-            out["nuclei_binary_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.np_decoder)
+            out["nuclei_binary_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.nuclei_binary_map_decoder)
 
-        out["hv_map"]          = self._forward_branch(z0, z1, z2, z3, z4, self.hv_decoder)
-        out["nuclei_type_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.nt_decoder)
+        out["hv_map"]          = self._forward_branch(z0, z1, z2, z3, z4, self.hv_map_decoder)
+        out["nuclei_type_map"] = self._forward_branch(z0, z1, z2, z3, z4, self.nuclei_type_maps_decoder)
 
         if retrieve_tokens:
             out["tokens"] = z4
@@ -238,13 +238,42 @@ class CellViTCustom(nn.Module):
     # ---------- encoder weight load ----------
     def load_vit_checkpoint(self, ckpt_path: Union[str, Path], strict: bool = False):
         """
-        HIPT ViT-256(small dino, teacher) 등에서 오는 checkpoint 키 전처리 후 encoder에 로드.
+        다양한 포맷(전체 모델 ckpt, Lightning, DINO/HIPT 등)을 받아
+        encoder(ViT) 파트만 추출·정규화해서 self.encoder에 로드.
         """
-        sd = torch.load(str(ckpt_path), map_location="cpu")
-        if isinstance(sd, dict) and "teacher" in sd and isinstance(sd["teacher"], dict):
-            sd = sd["teacher"]
-        # strip prefixes
-        sd = {k.replace("module.", "").replace("backbone.", ""): v for k, v in sd.items()}
+        blob = torch.load(str(ckpt_path), map_location="cpu")
+
+        # 1) 루트에서 state_dict 고르기 (우선순위)
+        sd = blob
+        if isinstance(blob, dict):
+            for k in ["model_state_dict", "state_dict", "teacher", "student", "model"]:
+                if k in blob and isinstance(blob[k], dict):
+                    sd = blob[k]
+                    print(f"[CellViTCustom] load_vit_checkpoint: picked '{k}'")
+                    break
+
+        # 2) 만약 전체 모델의 state_dict라면 encoder.* 서브트리만 추출
+        if isinstance(sd, dict) and any(k.startswith("encoder.") for k in sd.keys()):
+            sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+            print(f"[CellViTCustom] load_vit_checkpoint: kept encoder.* subset ({len(sd)} keys)")
+
+        # 3) 흔한 prefix 제거 (DP/백본/라이트닝)
+        sd = {k.replace("module.", "", 1).replace("backbone.", "", 1).replace("model.", "", 1): v
+              for k, v in sd.items()}
+
+        # 4) tissue head는 쓰지 않으면 제외
+        if self.num_tissue_classes == 0:
+            drop = [k for k in sd.keys() if k.startswith("head.")]
+            for k in drop: sd.pop(k)
+            if drop:
+                print(f"[CellViTCustom] load_vit_checkpoint: dropped head.* ({len(drop)} keys, num_tissue_classes=0)")
+
+        # (옵션) pos_embed shape 불일치 시 건너뛰고 로드
+        # 필요할 때 주석 해제
+        # if "pos_embed" in sd and sd["pos_embed"].shape != self.encoder.pos_embed.shape:
+        #     print("[CellViTCustom] load_vit_checkpoint: skipping pos_embed due to shape mismatch")
+        #     sd.pop("pos_embed")
+
         msg = self.encoder.load_state_dict(sd, strict=strict)
         try:
             mk, uk = msg.missing_keys, msg.unexpected_keys

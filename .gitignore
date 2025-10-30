@@ -4,3 +4,4 @@ wandb/
 tools
 utils/
 **/__pycache__/
+viz_out/
