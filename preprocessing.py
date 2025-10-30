@@ -40,7 +40,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -69,16 +69,17 @@ def pad_to_size(img: np.ndarray, target_hw: Tuple[int, int], mode: str = "consta
         return img
     assert h <= th and w <= tw, f"Input larger than target: {(h,w)} > {(th,tw)}"
     pad_h, pad_w = th - h, tw - w
+    # Cast mode to Any to appease numpy stubs that expect a callable protocol for mode
     if mode == "constant":
         if img.ndim == 2:
-            return np.pad(img, ((0, pad_h), (0, pad_w)), mode=mode, constant_values=constant_values)
+            return np.pad(img, ((0, pad_h), (0, pad_w)), mode=cast(Any, mode), constant_values=constant_values)
         else:
-            return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode=mode, constant_values=constant_values)
+            return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode=cast(Any, mode), constant_values=constant_values)
     else:
         if img.ndim == 2:
-            return np.pad(img, ((0, pad_h), (0, pad_w)), mode=mode)
+            return np.pad(img, ((0, pad_h), (0, pad_w)), mode=cast(Any, mode))
         else:
-            return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode=mode)
+            return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode=cast(Any, mode))
 
 
 def split_grid(arr: np.ndarray, patch: int = 256) -> List[np.ndarray]:

@@ -2,19 +2,18 @@
 import argparse
 from pathlib import Path
 from typing import Dict, Tuple, List
+from tqdm import tqdm
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # local datasets
 from Data.CoNSeP_patch import ConsepPatchDataset
 from Data.CoNSeP_patch_merged import ConsepPatchDatasetMerged
-# HF PanNuke loader (앞서 드린 파일 사용)
 from Data.PanNuke_hf import PanNukeHFDataset
 
 from Model.CellViT_ViT256_Custom import CellViTCustom
@@ -23,16 +22,10 @@ from Model.CellViT_ViT256_Custom import CellViTCustom
 # -----------------------------
 # Label spec (id->name, palette, remap)
 # -----------------------------
-def label_spec(dataset: str, merge_consep: bool) -> Tuple[Dict[int,str], Dict[int,Tuple[int,int,int]], Dict[int,int]]:
-    """
-    returns:
-      id2name: {class_id:int -> name:str}  (0은 배경이므로 필요시 제외)
-      palette: {class_id:int -> (R,G,B)}
-      remap:   {src_id:int -> dst_id:int}  (머지/아이덴티티)
-    """
-    dataset = dataset.lower()
+def label_spec(dataset: str, merge_consep: bool):
+    ds = dataset.lower()
 
-    if dataset == 'consep':
+    if ds == 'consep':
         if not merge_consep:
             id2name = {
                 1:"other", 2:"inflammatory", 3:"healthy epithelial",
@@ -45,22 +38,24 @@ def label_spec(dataset: str, merge_consep: bool) -> Tuple[Dict[int,str], Dict[in
                 4:(0,92,230), 5:(255,0,128), 6:(153,51,255), 7:(255,0,0)
             }
             return id2name, palette, remap
-        # merged
+        # 원본 consep를 merged 뷰로 볼 때만 사용
         id2name = {1:"other", 2:"inflammatory", 3:"epithelial (3+4)", 4:"spindle (5+6+7)"}
-        remap = {1:1, 2:2, 3:3, 4:3, 5:4, 6:4, 7:4}
+        remap   = {1:1, 2:2, 3:3, 4:3, 5:4, 6:4, 7:4}
         palette = {0:(0,0,0), 1:(76,153,0), 2:(255,127,0), 3:(0,176,240), 4:(255,0,128)}
         return id2name, palette, remap
 
-    elif dataset == 'pannuke_hf':
-        # PanNuke: 0=bg, 1..5 = Neoplastic, Inflammatory, Connective, Dead, Epithelial
-        id2name = {
-            1:"Neoplastic", 2:"Inflammatory", 3:"Connective", 4:"Dead", 5:"Epithelial"
-        }
-        remap = {k:k for k in id2name.keys()}  # no merge
-        palette = {
-            0:(0,0,0), 1:(0,176,240), 2:(255,127,0), 3:(76,153,0),
-            4:(128,128,128), 5:(255,0,128)
-        }
+    elif ds == 'consep_merged':
+        # 이미 [0..4]로 합쳐진 라벨이므로 항등 remap
+        id2name = {1:"other", 2:"inflammatory", 3:"epithelial (3+4)", 4:"spindle (5+6+7)"}
+        remap   = {1:1, 2:2, 3:3, 4:4}
+        palette = {0:(0,0,0), 1:(76,153,0), 2:(255,127,0), 3:(0,176,240), 4:(255,0,128)}
+        return id2name, palette, remap
+
+    elif ds == 'pannuke_hf':
+        # PanNuke: 0=bg, 1..5
+        id2name = {1:"Neoplastic", 2:"Inflammatory", 3:"Connective", 4:"Dead", 5:"Epithelial"}
+        remap   = {k:k for k in id2name.keys()}
+        palette = {0:(0,0,0), 1:(0,176,240), 2:(255,127,0), 3:(76,153,0), 4:(128,128,128), 5:(255,0,128)}
         return id2name, palette, remap
 
     else:
@@ -131,7 +126,6 @@ def evaluate_and_visualize(args):
 
     # Dataset/Loader
     if args.dataset == 'pannuke_hf':
-        from Data.PanNuke_hf import PanNukeHFDataset
         ds = PanNukeHFDataset(
             repo_id=args.hf_repo,
             split=args.hf_split,
@@ -148,15 +142,16 @@ def evaluate_and_visualize(args):
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                     num_workers=args.workers, pin_memory=True)
 
-    # Label spec
-    id2name, palette, remap = label_spec(args.dataset, args.merge_consep)
+    # consep에서만 --merge_consep 의미 있음
+    merge_flag = (args.dataset.lower() == 'consep') and args.merge_consep
+    id2name, palette, remap = label_spec(args.dataset, merge_flag)
 
     # Model
     model = CellViTCustom(
         num_nuclei_classes=args.num_classes,
         img_size=args.img_size,
         patch_size=args.patch_size,
-        embed_dim=args.vit_embed_dim,     # <- CellViTCustom 시그니처는 embed_dim
+        embed_dim=args.vit_embed_dim,
         depth=args.vit_depth,
         num_heads=args.vit_heads,
         mlp_ratio=args.vit_mlp_ratio,
@@ -177,17 +172,17 @@ def evaluate_and_visualize(args):
     classes_to_eval = list(range(1, C+1)) if args.exclude_bg else list(range(0, C+1))
 
     saved = 0
-    for batch in dl:
+    for batch in tqdm(dl, ncols=100, desc="Eval"):
         x = batch['image'].to(device, non_blocking=True)
         t = batch['type_map'].cpu().numpy()
         paths = batch['path_image']
 
-        # forward (no autocast needed here)
+        # forward
         nt_logits = model(x)['nuclei_type_map']
         nt_pred = torch.argmax(nt_logits, dim=1).cpu().numpy()
 
-        # remap when necessary (CoNSeP merged)
-        if args.dataset.startswith('consep') and args.merge_consep:
+        # remap: 오직 (원본 consep + --merge_consep)일 때만
+        if merge_flag:
             vt = np.vectorize(lambda k: remap.get(int(k), int(k)))
             t = np.stack([vt(t[i]) for i in range(t.shape[0])], axis=0)
             nt_pred = np.stack([vt(nt_pred[i]) for i in range(nt_pred.shape[0])], axis=0)
@@ -199,7 +194,7 @@ def evaluate_and_visualize(args):
         # update confusion
         update_confusion(conf, t.reshape(-1), nt_pred.reshape(-1), C)
 
-        # visualize (GT vs Pred, + legend)
+        # 시각화
         if args.max_samples > 0:
             for b in range(x.size(0)):
                 if saved >= args.max_samples:
@@ -279,13 +274,13 @@ def parse_args():
     # ViT-256 hyperparams (match your model)
     p.add_argument('--img_size', type=int, default=256)
     p.add_argument('--patch_size', type=int, default=16)
-    p.add_argument('--vit_embed_dim', type=int, default=384)  # <- CellViTCustom(embed_dim=..)
+    p.add_argument('--vit_embed_dim', type=int, default=384)
     p.add_argument('--vit_depth', type=int, default=12)
     p.add_argument('--vit_heads', type=int, default=6)
     p.add_argument('--vit_mlp_ratio', type=float, default=4.0)
 
     # num_classes (incl. background!)
-    # consep(original)=8, consep(merged)=5, pannuke=6
+    # consep(original)=8, consep_merged=5, pannuke=6
     p.add_argument('--num_classes', type=int, default=6,
                    help='#type classes incl. background. consep=8, consep_merged=5, pannuke=6')
     return p.parse_args()

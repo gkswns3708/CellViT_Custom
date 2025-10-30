@@ -1,24 +1,19 @@
+# eval_consep_metrics.py
 # -*- coding: utf-8 -*-
 """
-Evaluate CellViT (ViT-256) on CoNSeP (merged) Test set and compute
-Hover-Net style metrics: DICE, AJI, DQ, SQ, PQ.
+Evaluate CellViT (ViT-256) on CoNSeP (merged) test set and compute
+DICE, AJI, DQ, SQ, PQ (overall + per-class).
 
-Requirements:
+Requires:
     pip install scikit-image scipy
 
 Example:
     python eval_consep_metrics.py \
       --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
       --test_root Dataset/CoNSeP/Preprocessed/Test \
-      --batch_size 8 --device cuda
-
-Notes:
-    - This script expects the dataset batch to include a ground-truth instance
-      map under one of the keys: 'inst_map' or 'instance_map'. If not present,
-      the script will exit with an instruction to expose it from the dataset.
-    - The model output is expected to be a dict with keys similar to
-      {'bin_logits', 'hv_map', 'type_logits'}; adjust key mapping below if your
-      code uses different names.
+      --batch_size 8 --device cuda \
+      --out eval_out_consep_merged \
+      --save_csv eval_out_consep_merged/per_image_metrics.csv
 """
 
 import argparse
@@ -30,7 +25,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# repo-local imports (adjust if your paths differ)
+# repo-local imports (경로는 레포 구조에 맞춰 유지)
 from Model.CellViT_ViT256_Custom import CellViTCustom
 from Data.CoNSeP_patch_merged import ConsepPatchDatasetMerged
 
@@ -46,80 +41,24 @@ from skimage.segmentation import watershed
 
 def to_hwc01(x: torch.Tensor) -> np.ndarray:
     """(C,H,W) or (H,W) tensor -> (H,W,3) in [0,1]."""
-    if x.ndim == 3:  # C,H,W
+    if x.ndim == 3:
         arr = x.detach().cpu().float().numpy()
         if arr.shape[0] in (1, 3):
             arr = np.transpose(arr, (1, 2, 0))
             if arr.shape[2] == 1:
                 arr = np.repeat(arr, 3, axis=2)
         else:
-            # unknown channel first, try as HWC already
             arr = np.transpose(arr, (1, 2, 0))
     elif x.ndim == 2:
         arr = x.detach().cpu().float().numpy()
         arr = np.stack([arr]*3, axis=-1)
     else:
         raise ValueError('unexpected image ndim')
-    # normalize to [0,1]
     vmin, vmax = float(arr.min()), float(arr.max())
     if vmax > 1.5:
         arr = arr / 255.0
     arr = np.clip(arr, 0.0, 1.0)
     return arr
-
-
-def make_type_overlay(img01: np.ndarray, type_map: np.ndarray, class_names: dict, alpha: float = 0.45) -> np.ndarray:
-    """Overlay a discrete type_map onto RGB image in [0,1]."""
-    # fixed palette matching example figure
-    palette = {
-        0: (0.5, 0.5, 0.5),   # bg (unused, appears via alpha on gray)
-        1: (0.21, 0.49, 0.00),# other (greenish)
-        2: (1.00, 0.55, 0.00),# inflammatory (orange)
-        3: (0.27, 0.56, 0.96),# epithelial (blue)
-        4: (0.91, 0.00, 0.91),# spindle (magenta)
-    }
-    h, w = type_map.shape
-    color = np.zeros_like(img01)
-    for k, rgb in palette.items():
-        mask = (type_map == k)
-        if not np.any(mask):
-            continue
-        color[mask] = rgb
-    overlay = (1 - alpha) * img01 + alpha * color
-    overlay = np.clip(overlay, 0.0, 1.0)
-    return overlay
-
-
-def save_viz(fig_path: Path, img01: np.ndarray, gt_type: np.ndarray, pr_type: np.ndarray, class_names: dict):
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-
-    gt_overlay = make_type_overlay(img01, gt_type, class_names)
-    pr_overlay = make_type_overlay(img01, pr_type, class_names)
-
-    fig = plt.figure(figsize=(10, 7.5))
-    gs = fig.add_gridspec(2, 2)
-
-    ax0 = fig.add_subplot(gs[0, 0]); ax0.imshow(img01); ax0.set_title('Input'); ax0.axis('off')
-    ax1 = fig.add_subplot(gs[0, 1]); ax1.imshow(gt_overlay); ax1.set_title('GT Type'); ax1.axis('off')
-    ax2 = fig.add_subplot(gs[1, 0]); ax2.imshow(pr_overlay); ax2.set_title('Pred Type'); ax2.axis('off')
-    ax3 = fig.add_subplot(gs[1, 1]); ax3.axis('off'); ax3.set_title('Legend')
-
-    patches = []
-    for cid in sorted(class_names.keys()):
-        if cid == 0:
-            continue
-        name = f"{cid}: {class_names[cid]}"
-        # same palette as overlay
-        color_map = {1:(0.21,0.49,0.00), 2:(1.00,0.55,0.00), 3:(0.27,0.56,0.96), 4:(0.91,0.00,0.91)}
-        c = color_map.get(cid, (0.2,0.2,0.2))
-        patches.append(mpatches.Patch(color=c, label=name))
-    leg = ax3.legend(handles=patches, title='Cell types', loc='center')
-
-    fig.tight_layout()
-    fig_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
 
 
 def tensor_to_numpy(x: torch.Tensor) -> np.ndarray:
@@ -135,72 +74,63 @@ def _first_present(y, keys):
 
 def extract_pred_maps(y: dict):
     """Pick model outputs by tolerant key search.
-    Returns (bin_like, hv_map) where:
+    Returns (bin_logits_or_prob, hv_map, type_logits_or_idx) where:
         bin_like: (B,1|2,H,W) or (B,H,W)
         hv_map:   (B,2,H,W) or (B,H,W,2)
+        type_like: (B,C,H,W) logits or (B,H,W) indices or None
     """
     bin_like = _first_present(y, [
-        'bin_logits', 'nuclei_binary_map', 'binary_map', 'np_bin', 'bin'
+        'nuclei_binary_map', 'bin_logits', 'binary_map', 'np_bin', 'bin'
     ])
     hv_map = _first_present(y, ['hv_map', 'hv', 'np_hv'])
+    type_like = _first_present(y, ['nuclei_type_map', 'type_logits', 'type', 'np_type', 'type_map_pred'])
 
     if bin_like is None or hv_map is None:
         raise KeyError(
             f"Could not find required heads in model output. Got keys={list(y.keys())}.\n"
-            "Expected one of ['bin_logits','nuclei_binary_map','binary_map','np_bin','bin'] "
+            "Expected one of ['nuclei_binary_map','bin_logits','binary_map','np_bin','bin'] "
             "and one of ['hv_map','hv','np_hv']."
         )
-    return bin_like, hv_map
+    return bin_like, hv_map, type_like
 
 
 def postproc_to_instances(bin_prob: np.ndarray, hv_pred: np.ndarray,
                           bin_thresh: float = 0.5,
                           min_area: int = 10) -> np.ndarray:
     """Lightweight instance post-processing using watershed.
-
     Args:
-        bin_prob: (H, W) predicted nuclei probability (after sigmoid)
+        bin_prob: (H, W) nuclei probability in [0,1]
         hv_pred:  (H, W, 2) predicted HV maps
-        bin_thresh: threshold for nuclear region
-        min_area: remove instances smaller than this
-
     Returns:
-        inst_map: (H, W) labeled instance mask (0=background, 1..N instances)
+        inst_map: (H, W) labeled instance mask (0=background, 1..N)
     """
     H, W = bin_prob.shape
-
-    # Smooth prob for stability
     p = gaussian_filter(bin_prob, sigma=1.0)
 
     # foreground mask
     fg = p >= bin_thresh
     fg = remove_small_holes(fg, area_threshold=32)
     fg = remove_small_objects(fg, min_size=min_area)
-
     if not np.any(fg):
         return np.zeros((H, W), np.int32)
 
-    # Elevation for watershed: combine inverse prob + hv magnitude (encourage split)
-    hv_mag = np.sqrt(np.sum(hv_pred ** 2, axis=-1))  # (H,W)
+    # Elevation: inverse prob + hv magnitude
+    hv_mag = np.sqrt(np.sum(hv_pred ** 2, axis=-1))
     elev = (1.0 - p) + 0.5 * (hv_mag / (hv_mag.max() + 1e-6))
 
-    # Seeds via distance transform peaks
+    # Seeds via distance peaks
     dist = distance_transform_edt(fg)
     dist_s = gaussian_filter(dist, sigma=1.0)
-
-    # Create markers: threshold local peaks of smoothed distance
     thr = np.quantile(dist_s[fg], 0.75) if np.any(fg) else 0.0
     markers = (dist_s > max(thr, 1.0)).astype(np.int32)
     markers = remove_small_objects(markers.astype(bool), min_size=min_area).astype(np.int32)
     markers = label(markers)
-
     if markers.max() == 0:
-        # Fallback: connected components on fg
         markers = label(fg.astype(np.uint8))
 
     inst_map = watershed(elev, markers=markers, mask=fg)
 
-    # Remove tiny segments
+    # remove tiny segments
     for r in regionprops(inst_map):
         if r.area < min_area:
             inst_map[inst_map == r.label] = 0
@@ -209,49 +139,11 @@ def postproc_to_instances(bin_prob: np.ndarray, hv_pred: np.ndarray,
 
 
 # -------------------------------
-# Metrics (Hover-Net style)
-# -------------------------------
-# -------------------------------
-# Type-wise helpers
+# Metrics
 # -------------------------------
 
-
-def compute_instance_types_from_pixel_types(inst_map: np.ndarray, type_map: np.ndarray, num_classes: int, bg_index: int) -> dict:
-    """Return {instance_id: class_id} by majority vote over pixel-level types.
-    Background class is suppressed from voting.
-    """
-    out = {}
-    ids = [i for i in np.unique(inst_map) if i != 0]
-    for i_id in ids:
-        mask = (inst_map == i_id)
-        vals = type_map[mask]
-        if vals.size == 0:
-            out[i_id] = bg_index
-            continue
-        hist = np.bincount(vals, minlength=max(num_classes, vals.max()+1))
-        if bg_index < len(hist):
-            hist[bg_index] = 0
-        out[i_id] = int(np.argmax(hist)) if hist.sum() > 0 else bg_index
-    return out
-
-
-def filter_and_relabel(inst_map: np.ndarray, keep_ids: set) -> np.ndarray:
-    """Keep only instances whose id is in keep_ids; relabel to 1..K.
-    """
-    if len(keep_ids) == 0:
-        return np.zeros_like(inst_map)
-    out = np.zeros_like(inst_map)
-    cur = 0
-    for lab in np.unique(inst_map):
-        if lab == 0:
-            continue
-        if lab in keep_ids:
-            cur += 1
-            out[inst_map == lab] = cur
-    return out
 def dice_coefficient(gt_bin: np.ndarray, pr_bin: np.ndarray) -> float:
-    gt = gt_bin.astype(bool)
-    pr = pr_bin.astype(bool)
+    gt = gt_bin.astype(bool); pr = pr_bin.astype(bool)
     inter = (gt & pr).sum()
     denom = gt.sum() + pr.sum()
     return (2.0 * inter / denom) if denom > 0 else 1.0
@@ -277,38 +169,29 @@ def pairwise_iou(gt_labs: np.ndarray, pr_labs: np.ndarray) -> np.ndarray:
 
 
 def match_by_iou(iou: np.ndarray, thr: float = 0.5):
-    """Greedy matching of instances by IoU threshold.
-    Returns: list of (gi, pj, iou), unmatched_gt_ids, unmatched_pr_ids
-    """
+    """Greedy matching by IoU threshold."""
     if iou.size == 0:
         return [], list(range(iou.shape[0])), list(range(iou.shape[1]))
     iou_copy = iou.copy()
     matches = []
-    used_g = set()
-    used_p = set()
+    used_g, used_p = set(), set()
     while True:
         gi, pj = np.unravel_index(np.argmax(iou_copy), iou_copy.shape)
         best = iou_copy[gi, pj]
         if best < thr or best <= 0:
             break
         matches.append((gi, pj, float(best)))
-        used_g.add(gi)
-        used_p.add(pj)
-        iou_copy[gi, :] = -1
-        iou_copy[:, pj] = -1
-    all_g = set(range(iou.shape[0]))
-    all_p = set(range(iou.shape[1]))
-    um_g = sorted(list(all_g - used_g))
-    um_p = sorted(list(all_p - used_p))
+        used_g.add(gi); used_p.add(pj)
+        iou_copy[gi, :] = -1; iou_copy[:, pj] = -1
+    all_g = set(range(iou.shape[0])); all_p = set(range(iou.shape[1]))
+    um_g = sorted(list(all_g - used_g)); um_p = sorted(list(all_p - used_p))
     return matches, um_g, um_p
 
 
 def compute_pq(gt_labs: np.ndarray, pr_labs: np.ndarray, iou_thr: float = 0.5):
     iou = pairwise_iou(gt_labs, pr_labs)
     matches, um_g, um_p = match_by_iou(iou, thr=iou_thr)
-    tp = len(matches)
-    fp = len(um_p)
-    fn = len(um_g)
+    tp = len(matches); fp = len(um_p); fn = len(um_g)
     dq = tp / (tp + 0.5 * fp + 0.5 * fn) if (tp + fp + fn) > 0 else 1.0
     sq = (np.mean([m[2] for m in matches]) if tp > 0 else 0.0)
     pq = dq * sq
@@ -324,35 +207,64 @@ def compute_aji(gt_labs: np.ndarray, pr_labs: np.ndarray) -> float:
         return 0.0
 
     iou = pairwise_iou(gt_labs, pr_labs)
-    # For each GT, take best-matching pred (may be 0 IoU)
     used_pred = set()
     inter_sum = 0
     union_sum = 0
     for gi, g in enumerate(gt_ids):
-        # Best pred for this gt
         pj = int(np.argmax(iou[gi])) if iou.shape[1] > 0 else -1
         if pj >= 0:
             chosen_pred = pr_ids[pj]
             used_pred.add(chosen_pred)
-            gmask = (gt_labs == g)
-            pmask = (pr_labs == chosen_pred)
+            gmask = (gt_labs == g); pmask = (pr_labs == chosen_pred)
             inter = np.logical_and(gmask, pmask).sum()
             uni = np.logical_or(gmask, pmask).sum()
             inter_sum += inter
             union_sum += uni
         else:
-            # No preds at all
             gmask = (gt_labs == g)
-            inter_sum += 0
             union_sum += gmask.sum()
-
-    # Add unmatched preds area to denominator (per AJI def)
+    # add unmatched preds area to denominator
     unmatched_preds = [p for p in pr_ids if p not in used_pred]
     for p in unmatched_preds:
         pmask = (pr_labs == p)
         union_sum += pmask.sum()
-
     return inter_sum / max(union_sum, 1)
+
+
+# -------------------------------
+# Type-wise helpers
+# -------------------------------
+
+def compute_instance_types_from_pixel_types(inst_map: np.ndarray, type_map: np.ndarray, num_classes: int, bg_index: int) -> dict:
+    """Return {instance_id: class_id} by majority vote over pixel-level types (bg suppressed)."""
+    out = {}
+    ids = [i for i in np.unique(inst_map) if i != 0]
+    for i_id in ids:
+        mask = (inst_map == i_id)
+        vals = type_map[mask]
+        if vals.size == 0:
+            out[i_id] = bg_index
+            continue
+        hist = np.bincount(vals, minlength=max(num_classes, vals.max()+1))
+        if bg_index < len(hist):
+            hist[bg_index] = 0
+        out[i_id] = int(np.argmax(hist)) if hist.sum() > 0 else bg_index
+    return out
+
+
+def filter_and_relabel(inst_map: np.ndarray, keep_ids: set) -> np.ndarray:
+    """Keep only instances whose id is in keep_ids; relabel to 1..K."""
+    if len(keep_ids) == 0:
+        return np.zeros_like(inst_map)
+    out = np.zeros_like(inst_map)
+    cur = 0
+    for lab in np.unique(inst_map):
+        if lab == 0:
+            continue
+        if lab in keep_ids:
+            cur += 1
+            out[inst_map == lab] = cur
+    return out
 
 
 # -------------------------------
@@ -382,19 +294,21 @@ def parse_args():
     ap.add_argument('--iou_thr', type=float, default=0.5)
 
     # Binary/type head handling
-    ap.add_argument('--fg_index', type=int, default=-1, help='if bin head has 2 channels (bg/fg), which index is foreground (default=-1)')
+    ap.add_argument('--fg_index', type=int, default=-1, help='if bin head has 2 channels (bg/fg), which index is foreground (default=-1 => last)')
     ap.add_argument('--bg_index', type=int, default=0, help='background class index in type maps')
-    ap.add_argument('--class_names', type=str, default='bg,other,inflammatory,epithelial,spindle', help='comma-separated names for classes incl. background at index 0')
+    ap.add_argument('--class_names', type=str, default='bg,other,inflammatory,epithelial,spindle',
+                    help='comma-separated names for classes incl. background at index 0')
     ap.add_argument('--disable_amp', action='store_true', help='disable autocast mixed precision')
 
-    # Visualization
+    # Visualization (optional)
     ap.add_argument('--save_viz_dir', type=Path, default=None, help='directory to save qualitative overlays')
     ap.add_argument('--viz_max', type=int, default=32, help='maximum number of images to save (per run)')
 
-    # Output
+    # Outputs
+    ap.add_argument('--out', type=Path, default=Path('eval_out_consep_merged'),
+                    help='directory to save summary CSV (segmentation_metrics.csv)')
     ap.add_argument('--save_csv', type=Path, default=None, help='optional path to save per-image metrics csv')
     return ap.parse_args()
-
 
 
 def main():
@@ -424,7 +338,7 @@ def main():
     model.to(device)
     model.eval()
 
-    # Check GT instance availability (probe first sample)
+    # Probe GT instance availability
     first = ds_te[0]
     gt_inst_key = None
     for k in ['inst_map', 'instance_map', 'inst', 'instances']:
@@ -432,59 +346,60 @@ def main():
             gt_inst_key = k
             break
     if gt_inst_key is None:
-        print('[ERROR] Ground-truth instance map not found in dataset item.\n'
-              'Make sure ConsepPatchDatasetMerged.__getitem__ returns an instance label map under one of the keys\n'
-              "['inst_map', 'instance_map']")
+        print('[ERROR] GT instance map not found in dataset item.\n'
+              "ConsepPatchDatasetMerged.__getitem__ must return an instance map under one of: "
+              "['inst_map','instance_map','inst','instances']")
         sys.exit(1)
 
     # Accumulators
     dices, ajis, pqs, dqs, sqs = [], [], [], [], []
-    per_image = []  # for optional CSV
+    per_image = []  # optional CSV
 
     amp_enabled = (torch.cuda.is_available() and (not args.disable_amp))
 
+    # Per-class accumulators (exclude bg)
+    K = args.num_classes
+    class_ids = [c for c in range(K) if c != args.bg_index]
+    raw = [s.strip() for s in str(args.class_names).split(',') if s.strip()]
+    class_names = {i: (raw[i] if i < len(raw) else f'class{i}') for i in range(K)} if raw else {i: f'class{i}' for i in range(K)}
+    perclass = {
+        c: {'dice': [], 'aji': [], 'pq': [], 'dq': [], 'sq': [], 'tp': 0, 'fp': 0, 'fn': 0, 'support': 0}
+        for c in class_ids
+    }
+    overall_tp = overall_fp = overall_fn = 0
+
     with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_enabled):
         idx_offset = 0
-        # Prepare per-class accumulators (exclude background)
-        K = args.num_classes
-        class_ids = [c for c in range(K) if c != args.bg_index]
-        class_names = None
-        raw = [s.strip() for s in str(args.class_names).split(',') if s.strip()]
-        if raw:
-            class_names = {i: (raw[i] if i < len(raw) else f'class{i}') for i in range(K)}
-        else:
-            class_names = {i: f'class{i}' for i in range(K)}
-
-        perclass = {c: {'dice': [], 'aji': [], 'pq': [], 'dq': [], 'sq': []} for c in class_ids}
-
         for batch in tqdm(dl_te, ncols=100, desc='Eval'):
             x = batch['image'].to(device, non_blocking=True)
-            gt_bin = batch['bin_map']        # (B, H, W)
-            gt_inst = batch[gt_inst_key]     # (B, H, W) labeled
-            gt_type = batch.get('type_map', None)  # (B, H, W) class ids, optional but recommended
+            gt_bin = batch['bin_map']            # (B, H, W)
+            gt_inst = batch[gt_inst_key]         # (B, H, W) labeled
+            gt_type = batch.get('type_map', None)  # (B, H, W) class ids, optional
 
             y = model(x)
-            bin_like, hv_map = extract_pred_maps(y)
-            type_like = _first_present(y, ['type_logits', 'nuclei_type_map', 'type', 'np_type', 'type_map_pred'])
+            bin_like, hv_map, type_like = extract_pred_maps(y)
 
-            # bin_like -> (B,H,W)
+            # ---- nuclei prob (B,H,W)
             if bin_like.ndim == 4:
                 if bin_like.shape[1] == 1:
-                    bin_like = bin_like[:, 0]
-                elif bin_like.shape[1] == 2:  # bg/fg 2채널 (choose foreground by fg_index)
+                    prob = bin_like[:, 0]
+                    # logits or prob? heuristics
+                    minv = float(prob.min().detach().cpu()); maxv = float(prob.max().detach().cpu())
+                    bin_prob = prob.sigmoid() if (minv < 0.0 or maxv > 1.0) else prob
+                elif bin_like.shape[1] == 2:
+                    # 2ch logits -> softmax -> use foreground (fg_index or last)
                     fg_idx = args.fg_index if args.fg_index in (0, 1, -1) else -1
-                    bin_like = bin_like[:, fg_idx]
+                    sm = torch.softmax(bin_like, dim=1)
+                    bin_prob = sm[:, fg_idx]
                 else:
                     raise ValueError(f"Unexpected bin_like shape: {tuple(bin_like.shape)}")
-            elif bin_like.ndim != 3:
+            elif bin_like.ndim == 3:
+                minv = float(bin_like.min().detach().cpu()); maxv = float(bin_like.max().detach().cpu())
+                bin_prob = bin_like.sigmoid() if (minv < 0.0 or maxv > 1.0) else bin_like
+            else:
                 raise ValueError(f"Unexpected bin_like shape: {tuple(bin_like.shape)}")
 
-            # logits인지 prob인지 값 범위로 판별 후 sigmoid
-            minv = float(bin_like.min().detach().cpu())
-            maxv = float(bin_like.max().detach().cpu())
-            bin_prob = bin_like.sigmoid() if (minv < 0.0 or maxv > 1.0) else bin_like  # (B,H,W)
-
-            # hv_map -> (B,H,W,2)
+            # ---- hv to (B,H,W,2)
             if hv_map.ndim == 4 and hv_map.shape[1] == 2:
                 hv = hv_map.permute(0, 2, 3, 1).contiguous()
             elif hv_map.ndim == 4 and hv_map.shape[-1] == 2:
@@ -492,14 +407,13 @@ def main():
             else:
                 raise ValueError(f"hv_map must be (B,2,H,W) or (B,H,W,2), got {tuple(hv_map.shape)}")
 
-            # type_like -> (B,H,W) of discrete class ids (optional)
+            # ---- type logits -> indices (optional)
             type_argmax = None
             if type_like is not None:
-                if type_like.ndim == 4:
-                    # assume (B,C,H,W)
+                if type_like.ndim == 4:   # (B,C,H,W)
                     type_argmax = type_like.argmax(dim=1)
-                elif type_like.ndim == 3:
-                    type_argmax = type_like  # already indices
+                elif type_like.ndim == 3: # already indices
+                    type_argmax = type_like
                 else:
                     raise ValueError(f"Unexpected type_like shape: {tuple(type_like.shape)}")
 
@@ -512,15 +426,15 @@ def main():
 
                 pr_inst = postproc_to_instances(bp, hvp, bin_thresh=args.bin_thresh, min_area=args.min_area)
 
-                # Metrics
+                # Overall metrics
                 pr_bin = (pr_inst > 0).astype(np.uint8)
                 dice = dice_coefficient(gt_b, pr_bin)
                 aji = compute_aji(gt_i, pr_inst)
                 pq, dq, sq, tp, fp, fn = compute_pq(gt_i, pr_inst, iou_thr=args.iou_thr)
-
                 dices.append(dice); ajis.append(aji); pqs.append(pq); dqs.append(dq); sqs.append(sq)
+                overall_tp += tp; overall_fp += fp; overall_fn += fn
 
-                # Per-class metrics (need both GT type_map and pred type_like)
+                # Per-class metrics (need both GT type_map and predicted types)
                 if gt_type is not None and type_argmax is not None:
                     gt_type_map = gt_type[b].cpu().numpy().astype(np.int32)
                     pr_type_map = type_argmax[b].detach().cpu().numpy().astype(np.int32)
@@ -537,43 +451,33 @@ def main():
 
                         dice_c = dice_coefficient((gt_c > 0).astype(np.uint8), (pr_c > 0).astype(np.uint8))
                         aji_c  = compute_aji(gt_c, pr_c)
-                        pq_c, dq_c, sq_c, *_ = compute_pq(gt_c, pr_c, iou_thr=args.iou_thr)
+                        pq_c, dq_c, sq_c, tp_c, fp_c, fn_c = compute_pq(gt_c, pr_c, iou_thr=args.iou_thr)
 
-                        perclass[c]['dice'].append(dice_c)
-                        perclass[c]['aji'].append(aji_c)
-                        perclass[c]['pq'].append(pq_c)
-                        perclass[c]['dq'].append(dq_c)
-                        perclass[c]['sq'].append(sq_c)
+                        pc = perclass[c]
+                        pc['dice'].append(dice_c); pc['aji'].append(aji_c)
+                        pc['pq'].append(pq_c);     pc['dq'].append(dq_c); pc['sq'].append(sq_c)
+                        pc['tp'] += tp_c; pc['fp'] += fp_c; pc['fn'] += fn_c
+                        pc['support'] += len(gt_keep)  # GT 인스턴스 개수
 
-                # Visualization (if enabled and within limit)
-                if args.save_viz_dir is not None and (idx_offset + b) < args.viz_max:
-                    img01 = to_hwc01(batch['image'][b])
-                    # Prefer GT type if available for GT pane; else binary
-                    gt_type_map_vis = gt_type[b].cpu().numpy().astype(np.int32) if gt_type is not None else (gt_b > 0).astype(np.int32)
-                    # Prefer predicted type if available; else binary pred
-                    if type_argmax is not None:
-                        pr_type_map_vis = type_argmax[b].detach().cpu().numpy().astype(np.int32)
-                    else:
-                        pr_type_map_vis = (pr_inst > 0).astype(np.int32)
-                    save_viz(Path(args.save_viz_dir) / f"{idx_offset + b:05d}.png", img01, gt_type_map_vis, pr_type_map_vis, class_names)
-
-                per_image.append({
-                    'index': idx_offset + b,
-                    'dice': dice,
-                    'aji': aji,
-                    'pq': pq,
-                    'dq': dq,
-                    'sq': sq,
-                    'tp': tp, 'fp': fp, 'fn': fn
-                })
+                # Per-image CSV(옵션)
+                if args.save_csv is not None:
+                    per_image.append({
+                        'index': idx_offset + b,
+                        'dice': dice,
+                        'aji': aji,
+                        'pq': pq,
+                        'dq': dq,
+                        'sq': sq,
+                        'tp': tp, 'fp': fp, 'fn': fn
+                    })
             idx_offset += B
 
-    # Aggregate
+    # Aggregate means
     mean_dice = float(np.mean(dices)) if dices else 0.0
-    mean_aji  = float(np.mean(ajis)) if ajis else 0.0
-    mean_pq   = float(np.mean(pqs)) if pqs else 0.0
-    mean_dq   = float(np.mean(dqs)) if dqs else 0.0
-    mean_sq   = float(np.mean(sqs)) if sqs else 0.0
+    mean_aji  = float(np.mean(ajis))  if ajis  else 0.0
+    mean_pq   = float(np.mean(pqs))   if pqs   else 0.0
+    mean_dq   = float(np.mean(dqs))   if dqs   else 0.0
+    mean_sq   = float(np.mean(sqs))   if sqs   else 0.0
 
     print("==== Evaluation (CoNSeP merged) ====")
     print(f"DICE: {mean_dice:.4f}")
@@ -582,49 +486,57 @@ def main():
     print(f"  SQ: {mean_sq:.4f}")
     print(f"  PQ: {mean_pq:.4f}")
 
-    # Per-class summary (if computed)
-    if 'perclass' in locals() and any(len(v['pq']) for v in perclass.values()):
+    # Per-class summary (print)
+    if any(len(v['pq']) for v in perclass.values()):
         print("-- Per-class metrics (exclude background) --")
-        print(f"{'Class':<16} {'DICE':>8} {'AJI':>8} {'DQ':>8} {'SQ':>8} {'PQ':>8}")
+        print(f"{'Class':<16} {'DICE':>8} {'AJI':>8} {'DQ':>8} {'SQ':>8} {'PQ':>8} {'SUP':>6}")
         for c in class_ids:
-            d = perclass[c]
-            md = np.mean(d['dice']) if d['dice'] else 0.0
-            ma = np.mean(d['aji'])  if d['aji']  else 0.0
-            mdq= np.mean(d['dq'])   if d['dq']   else 0.0
-            msq= np.mean(d['sq'])   if d['sq']   else 0.0
-            mpq= np.mean(d['pq'])   if d['pq']   else 0.0
-            print(f"{class_names[c]:<16} {md:8.4f} {ma:8.4f} {mdq:8.4f} {msq:8.4f} {mpq:8.4f}")
+            pc = perclass[c]
+            md = float(np.mean(pc['dice'])) if pc['dice'] else 0.0
+            ma = float(np.mean(pc['aji']))  if pc['aji']  else 0.0
+            mdq= float(np.mean(pc['dq']))   if pc['dq']   else 0.0
+            msq= float(np.mean(pc['sq']))   if pc['sq']   else 0.0
+            mpq= float(np.mean(pc['pq']))   if pc['pq']   else 0.0
+            print(f"{class_names[c]:<16} {md:8.4f} {ma:8.4f} {mdq:8.4f} {msq:8.4f} {mpq:8.4f} {pc['support']:6d}")
 
-        macro_pq = np.mean([np.mean(perclass[c]['pq']) for c in class_ids if perclass[c]['pq']]) if class_ids else 0.0
-        print(f"Macro PQ (over {len(class_ids)} classes): {macro_pq:.4f}")
+    # ===== Save summary CSV (overall + per-class) =====
+    import csv
+    out_dir = args.out
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seg_csv = out_dir / "segmentation_metrics.csv"
 
-    # Optional CSV
+    # (참고) 카운트 기반 DQ도 계산 가능
+    dq_overall_counts = (overall_tp / max(overall_tp + 0.5*overall_fp + 0.5*overall_fn, 1e-6)
+                         if (overall_tp+overall_fp+overall_fn)>0 else 1.0)
+    pq_overall_counts = dq_overall_counts * mean_sq  # SQ는 매칭 IoU 평균이므로 mean_sq 사용
+
+    with open(seg_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["scope","class_id","class_name","DICE","AJI","DQ","SQ","PQ","support","TP","FP","FN"])
+        # overall
+        w.writerow([
+            "overall","-","-",
+            f"{mean_dice:.6f}", f"{mean_aji:.6f}",
+            f"{mean_dq:.6f}", f"{mean_sq:.6f}", f"{mean_pq:.6f}",
+            sum(perclass[c]['support'] for c in perclass), overall_tp, overall_fp, overall_fn
+        ])
+        # per-class
+        for c in class_ids:
+            pc = perclass[c]
+            md = float(np.mean(pc['dice'])) if pc['dice'] else 0.0
+            ma = float(np.mean(pc['aji']))  if pc['aji']  else 0.0
+            mdq= float(np.mean(pc['dq']))   if pc['dq']   else 0.0
+            msq= float(np.mean(pc['sq']))   if pc['sq']   else 0.0
+            mpq= float(np.mean(pc['pq']))   if pc['pq']   else 0.0
+            w.writerow([
+                "per-class", c, class_names.get(c, f"class{c}"),
+                f"{md:.6f}", f"{ma:.6f}", f"{mdq:.6f}", f"{msq:.6f}", f"{mpq:.6f}",
+                pc['support'], pc['tp'], pc['fp'], pc['fn']
+            ])
+    print(f"[Saved] {seg_csv}")
+
+    # Optional per-image CSV
     if per_image and args.save_csv is not None:
-        import csv
-        args.save_csv.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.save_csv, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(per_image[0].keys()))
-            w.writeheader()
-            for row in per_image:
-                w.writerow(row)
-        print(f"Saved per-image metrics to: {args.save_csv}")
-
-    mean_dice = float(np.mean(dices)) if dices else 0.0
-    mean_aji  = float(np.mean(ajis)) if ajis else 0.0
-    mean_pq   = float(np.mean(pqs)) if pqs else 0.0
-    mean_dq   = float(np.mean(dqs)) if dqs else 0.0
-    mean_sq   = float(np.mean(sqs)) if sqs else 0.0
-
-    print("\n==== Evaluation (CoNSeP merged) ====")
-    print(f"DICE: {mean_dice:.4f}")
-    print(f" AJI: {mean_aji:.4f}")
-    print(f"  DQ: {mean_dq:.4f}")
-    print(f"  SQ: {mean_sq:.4f}")
-    print(f"  PQ: {mean_pq:.4f}")
-
-    # Optional CSV
-    if per_image and args.save_csv is not None:
-        import csv
         args.save_csv.parent.mkdir(parents=True, exist_ok=True)
         with open(args.save_csv, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(per_image[0].keys()))
@@ -635,6 +547,5 @@ def main():
 
 
 if __name__ == '__main__':
+    print("[eval] CoNSeP merged segmentation metrics (DICE/AJI/DQ/SQ/PQ) runner")
     main()
-
-

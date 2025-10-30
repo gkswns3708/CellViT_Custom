@@ -236,52 +236,74 @@ class CellViTCustom(nn.Module):
         ]))
 
     # ---------- encoder weight load ----------
-    def load_vit_checkpoint(self, ckpt_path: Union[str, Path], strict: bool = False):
+    def load_vit_checkpoint(
+        self,
+        ckpt_path: Union[str, Path],
+        strict: bool = False,
+        interpolate_pos_embed: bool = False,
+    ):
         """
-        다양한 포맷(전체 모델 ckpt, Lightning, DINO/HIPT 등)을 받아
-        encoder(ViT) 파트만 추출·정규화해서 self.encoder에 로드.
+        다양한 포맷(전체 모델 ckpt / Lightning / DINO/HIPT teacher 등)을 받아
+        encoder(ViT) 파라미터만 추출·정규화해서 self.encoder에 로드.
+        옵션: pos_embed 크기 불일치 시 보간(interpolate) 가능.
         """
+        import math
         blob = torch.load(str(ckpt_path), map_location="cpu")
 
-        # 1) 루트에서 state_dict 고르기 (우선순위)
+        # 1) 루트에서 state_dict 선택 (우선순위)
         sd = blob
+        picked = None
         if isinstance(blob, dict):
             for k in ["model_state_dict", "state_dict", "teacher", "student", "model"]:
                 if k in blob and isinstance(blob[k], dict):
                     sd = blob[k]
-                    print(f"[CellViTCustom] load_vit_checkpoint: picked '{k}'")
+                    picked = k
                     break
+        if picked:
+            print(f"[CellViTCustom] load_vit_checkpoint: picked '{picked}'")
 
-        # 2) 만약 전체 모델의 state_dict라면 encoder.* 서브트리만 추출
+        # 2) 전체 모델 state_dict인 경우 encoder.* 서브트리만 추출
         if isinstance(sd, dict) and any(k.startswith("encoder.") for k in sd.keys()):
             sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
             print(f"[CellViTCustom] load_vit_checkpoint: kept encoder.* subset ({len(sd)} keys)")
 
-        # 3) 흔한 prefix 제거 (DP/백본/라이트닝)
+        # 3) 흔한 prefix 제거
         sd = {k.replace("module.", "", 1).replace("backbone.", "", 1).replace("model.", "", 1): v
               for k, v in sd.items()}
 
-        # 4) tissue head는 쓰지 않으면 제외
+        # 4) tissue head는 사용 안 하면 제거
         if self.num_tissue_classes == 0:
             drop = [k for k in sd.keys() if k.startswith("head.")]
             for k in drop: sd.pop(k)
             if drop:
                 print(f"[CellViTCustom] load_vit_checkpoint: dropped head.* ({len(drop)} keys, num_tissue_classes=0)")
 
-        # (옵션) pos_embed shape 불일치 시 건너뛰고 로드
-        # 필요할 때 주석 해제
-        # if "pos_embed" in sd and sd["pos_embed"].shape != self.encoder.pos_embed.shape:
-        #     print("[CellViTCustom] load_vit_checkpoint: skipping pos_embed due to shape mismatch")
-        #     sd.pop("pos_embed")
+        # 5) pos_embed 크기 다를 때 처리 (옵션)
+        if "pos_embed" in sd and sd["pos_embed"].shape != self.encoder.pos_embed.shape:
+            if interpolate_pos_embed:
+                # 1D abs pos_embed [1, N+1, D] 를 HxW grid로 가정해 보간
+                pe = sd["pos_embed"]
+                D = pe.shape[-1]
+                pe_tok, pe_grid = pe[:, :1], pe[:, 1:]              # [1,1,D], [1,N,D]
+                old_N = pe_grid.shape[1]
+                old_g = int(round(math.sqrt(old_N)))
+                new_g = self.img_size // self.patch_size
+                if old_g * old_g != old_N:
+                    print("[CellViTCustom] pos_embed interpolate skipped (non-square old grid)")
+                    sd.pop("pos_embed")
+                else:
+                    pe_grid = pe_grid.reshape(1, old_g, old_g, D).permute(0,3,1,2)       # [1,D,old_g,old_g]
+                    pe_grid = torch.nn.functional.interpolate(pe_grid, size=(new_g, new_g),
+                                                               mode="bicubic", align_corners=False)
+                    pe_grid = pe_grid.permute(0,2,3,1).reshape(1, new_g*new_g, D)        # [1,new_N,D]
+                    sd["pos_embed"] = torch.cat([pe_tok, pe_grid], dim=1)
+                    print(f"[CellViTCustom] interpolated pos_embed: {old_g}^2 -> {new_g}^2")
+            else:
+                print("[CellViTCustom] load_vit_checkpoint: skipping pos_embed due to shape mismatch")
+                sd.pop("pos_embed")
 
+        # 6) 최종 로드
         msg = self.encoder.load_state_dict(sd, strict=strict)
-        try:
-            mk, uk = msg.missing_keys, msg.unexpected_keys
-            print(f"[CellViTCustom] load_vit_checkpoint: missing={len(mk)} unexpected={len(uk)}")
-        except Exception:
-            print(f"[CellViTCustom] load_vit_checkpoint: loaded (strict={strict})")
-        return msg
-
     # ---------- optional: instance postproc ----------
     @torch.no_grad()
     def calculate_instance_map(self, predictions: Dict[str, torch.Tensor], magnification: Literal[20, 40] = 40
