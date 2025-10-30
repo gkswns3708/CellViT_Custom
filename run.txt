@@ -1,3 +1,6 @@
+# Download Model Checkpoints
+gdown --folder https://drive.google.com/drive/folders/1zFO4bgo7yvjT9rCJi_6Mt6_07wfr0CKU -O /workspace/CellViT_Custom/Checkpoints
+
 # ViT CpMSePTrain
 python train_custom_ViT.py \
   --train_root Dataset/transformed/CoNSeP/Train \
