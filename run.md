@@ -90,6 +90,42 @@ python infer_viz_images_panoptic.py \
   --bnd_thickness 1 --bnd_alpha 0.95 \
   --core_erode_px 2
 
+# CoNSeP 모드
+python infer_viz_images_panoptic.py \
+  --dataset consep \
+  --consep_root /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Test \
+  --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
+  --out eval_out/CoNSeP_panoptic \
+  --batch_size 8 --device cuda \
+  --img_size 256 --num_classes 5 \
+  --np_thresh 0.4 --min_size 10 \
+  --bnd_thickness 1 --bnd_alpha 0.95 \
+  --core_erode_px 2 \
+  --save_metrics_csv eval_out/CoNSeP_panoptic/per_image_metrics.csv
+
+# 일반 이미지 폴더 모드 (GT 디렉토리 옵션)
+python infer_viz_images_panoptic.py \
+  --dataset consep \
+  --consep_root /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Test \
+  --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
+  --out eval_out/CoNSeP_panoptic \
+  --batch_size 8 --device cuda \
+  --img_size 256 --num_classes 5 \
+  --np_thresh 0.5 --min_size 10 \
+  --bnd_thickness 1 --bnd_alpha 0.95 \
+  --core_erode_px 2 \
+  --save_metrics_csv eval_out/CoNSeP_panoptic/per_image_metrics.csv \
+  --debug_uniques
+
+python infer_viz_images_panoptic.py \
+    --dataset consep \
+    --ckpt Checkpoints/CellViT/cellvit_vit256_consep_merged_best.pth \
+    --consep_root /workspace/CellViT_Custom/Dataset/CoNSeP/Preprocessed/Test \
+    --out eval_out/CoNSeP_panoptic \
+    --device cuda \
+    --save_hv_grad
+
+
 # PanNuke CV3 Train from Scratch at PaNNuke
 python train_eval_pannuke_cv3.py \
   --hf_repo RationAI/PanNuke \
